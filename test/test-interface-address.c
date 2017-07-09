@@ -22,6 +22,8 @@
 #include "uv.h"
 #include "task.h"
 
+#ifdef __linux__
+
 #include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
@@ -149,3 +151,4 @@ TEST_IMPL(interface_address) {
   MAKE_VALGRIND_HAPPY();
   return 0;
 }
+#endif
