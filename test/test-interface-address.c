@@ -28,55 +28,46 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
+#include <linux/if_bridge.h>
 #include <net/if_arp.h>
 #include <ifaddrs.h>
+#include <net/if.h>
 
 TEST_IMPL(interface_address) {
   struct ifreq ifr;
   struct sockaddr_in *addr = NULL;
   uv_interface_address_t *interfaces = NULL;
-  int fd = 0, s = 0, count = 0;
-  int has_tap = 0, i = 0;
-  char ip[17];
-  char *clonedev = "/dev/net/tun";
+  int s = 0, count = 0, ifindex = 0;
+  int has_bridge = 0, i = 0, ret = 0;
+  char ip[17], net[IFNAMSIZ];
+  char *brname = "br0";
 
   memset(&ifr, 0, sizeof(ifr));
 
   /*
-   * Create tap device
-   */
-  fd = open(clonedev, O_RDWR);
-  ASSERT(0 < fd);
-
-  ifr.ifr_flags = IFF_TAP;
-  strncpy(ifr.ifr_name, "tap0", IFNAMSIZ);
-
-  ASSERT(0 == ioctl(fd, TUNSETIFF, (void *) &ifr));
-
-  ASSERT(0 == strcmp("tap0", ifr.ifr_name));
-
-  /*
-   * Unregister the existing tap0 device
-   */
-  ASSERT(0 == ioctl(fd, TUNSETPERSIST, 0));
-  /*
-   * Register the existing tap0 device
-   */
-  ASSERT(0 == ioctl(fd, TUNSETPERSIST, 1));
-
-  /*
-   * Open a new socket so we can set
-   * the ip and mac address of the
-   * tap0 device
+   * Open a new socket so we can create
+   * a new bridge device and set the ip
+   * and mac address of the br0 device
    */
   s = socket(AF_INET, SOCK_DGRAM, 0);
   ASSERT(0 < s);
 
+#ifdef SIOCBRADDBR
+  ret = ioctl(s, SIOCBRADDBR, brname);
+  if(ret < 0)
+#endif
+  {
+    char _br[IFNAMSIZ];
+    unsigned long arg[3] = { BRCTL_ADD_BRIDGE, _br };
+
+    strncpy(_br, brname, IFNAMSIZ);
+    ret = ioctl(s, SIOCSIFBR, arg);
+    ASSERT(0 == ret || errno == EEXIST);
+  }
+
   memset(&ifr, 0, sizeof(ifr));
 
-  strcpy(ifr.ifr_name, "tap0");
+  strcpy(ifr.ifr_name, brname);
   memset(&ifr.ifr_hwaddr.sa_data[0], 0xAA, 1);
   memset(&ifr.ifr_hwaddr.sa_data[1], 0xBB, 1);
   memset(&ifr.ifr_hwaddr.sa_data[2], 0xCC, 1);
@@ -89,36 +80,66 @@ TEST_IMPL(interface_address) {
   ifr.ifr_addr.sa_family = AF_INET;
 
   /*
-   * Set the tap device ip address
+   * Set the br0 device ip address
    */
   addr = (struct sockaddr_in *)&ifr.ifr_addr;
   inet_pton(AF_INET, "10.0.1.2", &addr->sin_addr);
   ASSERT(0 == ioctl(s, SIOCSIFADDR, &ifr));
 
   /*
-   * Set the tap device netmask
+   * Set the br0 device netmask
    */
   inet_pton(AF_INET, "255.255.0.0", ifr.ifr_addr.sa_data + 2);
   ASSERT(0 == ioctl(s, SIOCSIFNETMASK, &ifr));
 
   /*
-   * Make sure the tap device is up and running
+   * Make sure the br0 device is up and running
    */
   ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
   ASSERT(0 == ioctl(s, SIOCSIFFLAGS, &ifr));
 
   /*
-   * We need to call a read to actually make
-   * the system know the tap device is running
+   * In order to get the br0 device labeled as
+   * running, we need to attach a common network
+   * device to it.
    */
-  ASSERT(0 == read(fd, NULL, 0));
+  ASSERT(0 == uv_interface_addresses(&interfaces, &count));
+  ASSERT(0 < count);
+  ASSERT(NULL != interfaces);
+  for(i=0;i<count;i++) {
+    if(strcmp(interfaces[i].name, "lo") != 0) {
+      ifindex = if_nametoindex(interfaces[i].name);
+      if(ifindex >= 0) {
+        strcpy(net, interfaces[i].name);
+        break;
+      }
+    }
+  }
+
+  uv_free_interface_addresses(interfaces, count);
+
+  ASSERT(0 <= ifindex);
+
+  strncpy(ifr.ifr_name, brname, IFNAMSIZ);
+#ifdef SIOCBRADDIF
+  ifr.ifr_ifindex = ifindex;
+  ret = ioctl(s, SIOCBRADDIF, &ifr);
+  if (ret < 0)
+#endif
+  {
+    unsigned long args[4] = { BRCTL_ADD_IF, ifindex, 0, 0 };
+
+    ifr.ifr_data = (char *)args;
+    ret = ioctl(s, SIOCDEVPRIVATE, &ifr);
+    ASSERT(ret == 0);
+  }
 
   ASSERT(0 == uv_interface_addresses(&interfaces, &count));
   ASSERT(0 < count);
   ASSERT(NULL != interfaces);
 
   for(i=0;i<count;i++) {
-    if(strcmp(interfaces[i].name, "tap0") == 0) {
+    if(strcmp(interfaces[i].name, "br0") == 0) {
       ASSERT(AF_INET == interfaces[i].address.address4.sin_family);
       uv_ip4_name(&interfaces[i].address.address4, ip, sizeof(ip));
       ASSERT(0 == strcmp(ip, "10.0.1.2"));
@@ -133,20 +154,44 @@ TEST_IMPL(interface_address) {
       ASSERT(0xEE == (interfaces[i].phys_addr[4] & 0xFF));
       ASSERT(0xFF == (interfaces[i].phys_addr[5] & 0xFF));
 
-      has_tap = 1;
+      has_bridge = 1;
       break;
     }
   }
 
   uv_free_interface_addresses(interfaces, count);
 
-  ASSERT(1 == has_tap);
+#ifdef SIOCBRDELIF
+  ifr.ifr_ifindex = ifindex;
+  ret = ioctl(s, SIOCBRDELIF, &ifr);
+  if (ret < 0)
+#endif
+  {
+    unsigned long args[4] = { BRCTL_DEL_IF, ifindex, 0, 0 };
 
+    ifr.ifr_data = (char *) args;
+    ret = ioctl(s, SIOCDEVPRIVATE, &ifr);
+    ASSERT(0 == ret);
+  }
+
+  ifr.ifr_flags = 0;
+  ASSERT(0 == ioctl(s, SIOCSIFFLAGS, &ifr));
+
+  ASSERT(1 == has_bridge);
+
+#ifdef SIOCBRDELBR
+  ret = ioctl(s, SIOCBRDELBR, brname);
+  if (ret < 0)
+#endif
+  {
+    char _br[IFNAMSIZ];
+    unsigned long arg[3] = { BRCTL_DEL_BRIDGE, (unsigned long) _br };
+
+    strncpy(_br, brname, IFNAMSIZ);
+    ret = ioctl(s, SIOCSIFBR, arg);
+    ASSERT(ret == 0 || errno == ENXIO);
+  }
   close(s);
-  /*
-   * Remove the tap device again
-   */
-  ASSERT(0 == ioctl(fd, TUNSETPERSIST, 0));
 
   MAKE_VALGRIND_HAPPY();
   return 0;
